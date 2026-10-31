@@ -1,0 +1,13 @@
+[Unit]
+Description=GB10 dynamic clock governor (SparkCluster, target 85C)
+Documentation=file:///home/oliver/Development/SparkCluster/dynamic-clocks.md
+
+[Service]
+Type=simple
+User=root
+Restart=on-failure
+RestartSec=5
+ExecStart=/usr/bin/python3 /home/oliver/gb10-clock-governor.py --target 85
+
+[Install]
+WantedBy=multi-user.target
