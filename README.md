@@ -55,6 +55,49 @@ python3 gb10-clock-governor.py --target 65 --ceiling 92   # hold die at 65C, boa
 python3 gb10-clock-governor.py --dry-run                  # log the clock it WOULD set, apply nothing
 ```
 
+## Why die-targeted, not board-zone?
+
+The GB10's board/ACPI thermal zones run ~20–30 °C **hotter** than the GPU die and swing hard — a
+single zone can jump ~10 °C in a few seconds. The original (v1) design chased the **hottest board
+zone**, so the clock followed the board's noise (≈1410↔2392 MHz) even though the die itself stayed
+cool (~50–70 °C).
+
+We switched to holding the **die** because:
+
+- It's the sensor NVIDIA's own thermal protection watches — the GPU throttles the **die** at
+  ~87 °C, so the die is what actually caps performance and longevity.
+- It's thermally stable, so controlling it holds the clock steady instead of chasing board spikes.
+- Board zones still matter (they sit on top of VRM/VRAM that `nvidia-smi` can't read), so they're
+  kept as a hard **ceiling** — but only as a fallback that bites near a component limit, never as
+  the normal driver.
+
+Result: the clock pins to the top rung (~2390 MHz) with zero throttling, and the board stays under
+its ceiling.
+
+## Tuning the knobs
+
+The two most-common tweaks are passed by the **service**; everything else lives in the **script**.
+
+| Setting | Controls | Default | Where to change it |
+| --- | --- | --- | --- |
+| `--target` | GPU **die** °C to hold (the primary control) | 65 | Service `ExecStart`, then `daemon-reload` + `restart`. |
+| `--ceiling` | Hottest **board** zone that forces a throttle-down | 92 | Service `ExecStart`, then `daemon-reload` + `restart`. |
+| `--band` | Hysteresis — the clock only moves outside `target ± band` | 2.0 °C | Script, line ~84. Edit + redeploy. |
+| `--hard` | Die emergency °C — step toward the floor | 89 °C | Script, line ~82. Edit + redeploy. |
+| `--clock-max` / `--clock-floor` | Highest / lowest ladder rung | 2400 / 1500 MHz | Script, lines 86–85. Edit + redeploy. |
+| `--interval` | Seconds between samples | 8 | Script, line ~87. Edit + redeploy. |
+| `LADDER` | The ceiling steps themselves | `[2400,2200,…,1200]` MHz | Script, line 23. Edit + redeploy. |
+
+**Changing `--target` / `--ceiling`** (the common ones): edit the `ExecStart` line in
+`gb10-clock-governor.service` on each node, then:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart gb10-clock-governor.service
+```
+
+Any other knob is a **script** edit — change the value, then re-deploy the script and restart on
+both nodes. (The service runs as root, so the script edits also go to `/home/oliver/gb10-clock-governor.py`.)
+
 ## Measured effect (v2 — die target + board ceiling)
 
 Two-tier config `--target 65 --ceiling 92`, both nodes under a deepseek-v4.x decode workload:

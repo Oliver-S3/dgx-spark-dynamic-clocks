@@ -51,6 +51,38 @@ Closed-loop ladder of clock ceilings, driven by a **two-tier** sensor strategy:
 - Usage: `python3 gb10-clock-governor.py --target 65 --ceiling 92` (deploy), or add
   `--dry-run` to log the proposed clock without applying `-lgc`.
 
+## Why die-targeted, not board-zone?
+
+The GB10's board/ACPI zones run ~20–30 °C **hotter** than the die and swing hard — a single zone
+can jump ~10 °C in seconds. The original (v1) design chased the hottest board zone, so the clock
+followed the board's noise (≈1410↔2392 MHz) while the die stayed cool (~50–70 °C). We hold the
+**die** instead because:
+
+- It's the sensor NVIDIA's thermal protection watches — the GPU throttles the **die** at ~87 °C,
+  so the die is what actually caps performance and longevity.
+- It's thermally stable, so controlling it holds the clock steady instead of chasing board spikes.
+- Board zones still matter (VRM/VRAM that `nvidia-smi` can't read), so they're kept as a hard
+  **ceiling** — a fallback that bites near a component limit, never the normal driver.
+
+Result: the clock pins to the top rung (~2390 MHz) with zero throttling; the board stays under its
+ceiling.
+
+## Tuning the knobs
+
+| Setting | Controls | Default | Where to change it |
+| --- | --- | --- | --- |
+| `--target` | GPU **die** °C to hold (primary control) | 65 | Service `ExecStart` → `daemon-reload` + `restart`. |
+| `--ceiling` | Hottest **board** zone that forces a throttle-down | 92 | Service `ExecStart` → `daemon-reload` + `restart`. |
+| `--band` | Clock only moves outside `target ± band` | 2.0 °C | Script (~line 84). Edit + redeploy. |
+| `--hard` | Die emergency °C — step toward the floor | 89 °C | Script (~line 82). Edit + redeploy. |
+| `--clock-max` / `--clock-floor` | Highest / lowest ladder rung | 2400 / 1500 MHz | Script (~lines 86–85). Edit + redeploy. |
+| `--interval` | Seconds between samples | 8 | Script (~line 87). Edit + redeploy. |
+| `LADDER` | The ceiling steps themselves | `[2400,2200,…,1200]` MHz | Script (line 23). Edit + redeploy. |
+
+**Changing `--target` / `--ceiling`** (the common tweaks): edit `ExecStart` in the unit on each
+node, then `sudo systemctl daemon-reload && sudo systemctl restart gb10-clock-governor.service`.
+All other knobs are **script** edits — change, re-deploy to both nodes, restart.
+
 ## Test results (v2, live — `--target 65 --ceiling 92`)
 
 Both nodes under a deepseek-v4.x decode workload (concurrency 12, `max_tokens` 2048), 4-minute
@@ -79,8 +111,7 @@ in `README.md` for history but are not directly comparable (a board-zone target 
 Per node (spark-1 = `<spark-1-ip>`, spark-2 = `<spark-2-ip>`):
 
 ```bash
-# 1. governor script + unit (as oliver, passwordless for these paths where permitted;
-#    on spark-2 the deploy itself needs password sudo for /home writes only if not permitted)
+# 1. push the two files (user-land paths; no password):
 scp gb10-clock-governor.service oliver@<node>:/tmp/
 scp gb10-clock-governor.py  oliver@<node>:/home/oliver/
 # 2. install + enable (needs root):
