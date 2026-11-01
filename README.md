@@ -1,9 +1,10 @@
 # DGX Spark (GB10) dynamic clock governor — a temperature-target clock profile
 
 A small systemd service that runs a closed-loop clock governor on each NVIDIA DGX Spark / GB10
-node. It holds the GPU near a target temperature (validated at **85 °C**) by walking the
-`nvidia-smi -lgc` runtime clock ceiling up/down, so clocks and throughput self-adjust to the
-thermal situation instead of running flat at max boost.
+node. It holds the **GPU die** near a target temperature by walking the `nvidia-smi -lgc`
+runtime clock ceiling up/down, so clocks and throughput self-adjust to the thermal situation
+instead of running flat at max boost. A hard board-zone ceiling guards VRM/VRAM without
+driving normal throttling.
 
 > **Why this exists.** The DGX Spark's fans barely ramp at high temperatures and cannot be
 > adjusted from userland — NVIDIA's embedded-controller (EC) owns the whole cooling policy and
@@ -36,34 +37,39 @@ A separate, related attempt to control the fans directly is
 - Read the **running** clock (`nvidia-smi -q -d CLOCK` → `Clocks → Graphics`) to verify; the
   `Applications Clocks` field does **not** reflect the cap.
 
-The governor walks a fixed ladder of ceilings driven by the **hottest** sensor on the node:
+The governor walks a fixed ladder of ceilings using a **two-tier** sensor strategy:
 
 - **Ladder:** `[2400, 2200, 2000, 1800, 1700, 1500, 1300, 1200]` MHz (high → low).
-- Steps the clock **down** when `hottest > target + band` (default band `2.0 °C`) or when
-  `hottest >= --hard` (emergency jump). Steps **up** when `hottest < target - band`.
-- **Hottest sensor** = max over all `/sys/class/thermal/thermal_zone*/temp` and
-  `nvidia-smi temperature.gpu`. On the GB10 the board/ACPI zones (5/6, and 0) read hotter than
-  the GPU die — that's the value held at the target.
+- **Primary target — GPU die** (`nvidia-smi temperature.gpu`): steps the clock **down** when
+  `die > target + band` (default band `2.0 °C`) or `die >= --hard` (emergency jump), and
+  **up** when `die < target - band`. The die is the controlled variable, so clocks hold steady
+  instead of chasing noisy board zones.
+- **Safety ceiling — hottest board zone** (max over all `/sys/class/thermal/thermal_zone*/temp`):
+  a hard `--ceiling` (default `92 °C`) that forces a throttle-down only if a board zone approaches
+  a component limit. Board zones guard VRM/VRAM; they no longer drive normal throttling.
 - **SIGTERM/SIGINT** reset the clocks to default (`-rgc`) and exit; `Restart=on-failure` in the
   unit restarts it if it ever dies.
 
 ```bash
-python3 gb10-clock-governor.py --target 85        # °C to hold on the hottest zone
-python3 gb10-clock-governor.py --target 85 --band 2.0 --interval 8 --hard 87
+python3 gb10-clock-governor.py --target 65 --ceiling 92   # hold die at 65C, board ceiling 92C
+python3 gb10-clock-governor.py --dry-run                  # log the clock it WOULD set, apply nothing
 ```
 
-## Measured effect (heavy sustained decode load)
+## Measured effect (v2 — die target + board ceiling)
 
-Steady-state under a deepseek-v4.x decode workload (concurrency 12, `max_tokens` 2048):
+Two-tier config `--target 65 --ceiling 92`, both nodes under a deepseek-v4.x decode workload:
 
-| Target | Hottest zone | Clock (steady) | Decode throughput | Power |
-|--------|--------------|----------------|-------------------|-------|
-| 80 °C  | ~80.8 °C     | ~1787 MHz      | 128.8 out tok/s   | ~32 W |
-| **85 °C** | ~84.0 °C  | ~1981 MHz      | **143.1 out tok/s (+11 %)** | ~38 W |
+| Node | Die (steady) | Board (steady / max) | Clock (steady) | Throttle events |
+|------|--------------|----------------------|----------------|-----------------|
+| spark-1 | ~62 °C | 75–84 °C / 84 °C | ~2392 MHz (top rung) | 0 |
+| spark-2 | ~63 °C | 71–88 °C / 88 °C | ~2379 MHz (top rung) | 0 |
 
-At **85 °C** the governor holds the hottest zone around ~84 °C and runs ~2000 MHz, giving
-**~11 % more decode throughput** than 80 °C for ~3 °C more heat. The 85-vs-80 gap is consistent;
-the absolute steady-state clock drifts somewhat with thermal soak length.
+The die settles at the target while the board stays well under the 92 °C ceiling, and the clock
+holds the **top ladder rung the entire time** — no oscillation, zero throttling. This is the
+intended improvement over the v1 board-zone design, which chased the hottest board zone and let the
+clock swing ~1410↔2392 MHz while the die stayed cool (~50–70 °C). (The v1 80/85 °C numbers above
+referred to a *board-zone* target ≈ 60 °C die; the v2 die target is a different, cooler sensor, so
+the two are not directly comparable by number.)
 
 ## Files
 
@@ -72,6 +78,7 @@ the absolute steady-state clock drifts somewhat with thermal soak length.
 | `gb10-clock-governor.py` | The governor (closed-loop clock ladder). |
 | `gb10-clock-governor.service` | systemd unit: runs the governor as **root**, `Restart=on-failure`, enabled at boot. |
 | `verify-gov.sh` | Prints the running clock, GPU temp, and hottest thermal zone — for a quick check. |
+| `monitor.py` | Read-only observer: logs die, board, and running clock (reuses the governor's clock parse). Never writes a clock — safe on a live, shared-GPU node for validating the logic. |
 | `dynamic-clocks.md` | Extended notes (mechanism, test results, safety). |
 | `before.png` / `after.png` | Before/after thermal screenshots. |
 

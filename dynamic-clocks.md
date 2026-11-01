@@ -1,16 +1,21 @@
 # GB10 Dynamic Clock Governor (SparkCluster)
 
-A systemd service that runs a closed-loop clock governor on each GB10 node, holding the
-GPU near a target temperature (validated at **85 °C**) via `nvidia-smi -lgc`, so clocks and
-throughput self-adjust to the thermal situation instead of running flat at max boost.
+A systemd service that runs a closed-loop clock governor on each GB10 node using a
+**two-tier** sensor strategy: it holds the **GPU die** near a target temperature via
+`nvidia-smi -lgc` (walking the runtime clock ceiling up/down), while a hard **board-zone**
+ceiling guards VRM/VRAM without driving normal throttling. Clocks and throughput
+self-adjust to the thermal situation instead of running flat at max boost.
 
 ## TL;DR
 
 - Under a heavy sustained decode load, `nvidia-smi -lgc` **does** throttle the clock on GB10.
   (Earlier "no-op" verdicts were a measurement bug: malformed `-lgc 0 1500` with a space and
   reading the wrong clock field — "Applications Clocks", which never reflects `-lgc`.)
-- At **85 °C** the governor holds ~84 °C hottest zone and runs ~2000 MHz, giving
-  **~11% more decode throughput** than the **80 °C** target (~1790 MHz), for ~3 °C more heat.
+- **v2 uses a two-tier controller:** the **GPU die** is the primary target (held via the clock
+  ladder), and the **hottest board zone** is a hard `--ceiling` safety fallback. Controlling the
+  die makes clocks hold **steady** instead of chasing noisy board zones.
+- Live on both nodes with `--target 65 --ceiling 92`: the clock pins to the **top ladder rung**
+  (~2380–2392 MHz) with **zero throttling** and board temps 71–88 °C (under the 92 °C ceiling).
 - The service runs as **root** so it works on every node without a passwordless-nvidia-smi
   sudoers entry. Unit + deploy script are version-controlled here.
 
@@ -29,38 +34,43 @@ throughput self-adjust to the thermal situation instead of running flat at max b
 
 ## The governor script: `gb10-clock-governor.py`
 
-Closed-loop ladder of clock ceilings, driven by the hottest sensor on the node:
+Closed-loop ladder of clock ceilings, driven by a **two-tier** sensor strategy:
 
 - **Ladder:** `[2400, 2200, 2000, 1800, 1700, 1500, 1300, 1200]` MHz.
-- **Target / band:** steps the clock down when `hottest > target + band` (default band 2.0 °C),
-  up when `hottest < target - band`. `--clock-floor 1500` / `--clock-max 2400` clamp the ladder.
-- **Hottest sensor** = max over all `/sys/class/thermal/thermal_zone*/temp` and
-  `nvidia-smi temperature.gpu`. Zones 5/6 (and 0) run hottest (~88–96 °C); GPU die is cooler.
-- **Emergency `--hard` jump** toward the floor if a threshold is exceeded.
+- **Primary — GPU die** (`nvidia-smi temperature.gpu`): steps the clock **down** when
+  `die > target + band` (default band 2.0 °C) or `die >= --hard`, **up** when `die < target - band`.
+  `--clock-floor 1500` / `--clock-max 2400` clamp the ladder.
+- **Safety ceiling — hottest board zone** (max over all `/sys/class/thermal/thermal_zone*/temp`):
+  a hard `--ceiling` (default 92 °C) that forces a throttle-down only near a component limit.
+  Board zones guard VRM/VRAM; they do **not** drive normal throttling. On the GB10 board/ACPI
+  zones run hotter than the die — that gap is exactly why the die is the controlled variable.
+- **`--dry-run`:** logs the clock the ladder *would* set against the live clock, applying **no**
+  `-lgc`. Safe to validate the logic on a live, shared-GPU node before deploying.
 - **Signals:** SIGTERM/SIGINT reset clocks to default (`-rgc`) then exit. `Restart=on-failure`
   in the unit restarts it if it dies.
-- Usage: `python3 gb10-clock-governor.py --target 85 [--band 2.0] [--interval 3]`.
+- Usage: `python3 gb10-clock-governor.py --target 65 --ceiling 92` (deploy), or add
+  `--dry-run` to log the proposed clock without applying `-lgc`.
 
-## Test results (`drive.py`, heavy sustained load: deepseek-v4.1-flash, concurrency 12,
-max_tokens 2048, hitting :8000)
+## Test results (v2, live — `--target 65 --ceiling 92`)
 
-Steady-state (last 120 s), both targets reached a stable equilibrium (no thermal-throttle
-events; the governor held below the 90–97 °C throttle band):
+Both nodes under a deepseek-v4.x decode workload (concurrency 12, `max_tokens` 2048), 4-minute
+samples, die as the controlled variable:
 
-| Target | Hottest zone | Clock (steady) | Decode throughput | Power |
-|--------|--------------|----------------|-------------------|-------|
-| **80 °C** | 80.8 °C | ~1787 MHz (1800 rung) | **128.8** out tok/s | 32.1 W |
-| **85 °C** | 84.0 °C | ~1981 MHz (2000 rung) | **143.1** out tok/s (+11%) | 38.5 W |
+| Node | Die (steady) | Board (steady / max) | Clock (steady) | Throttle events |
+|------|--------------|----------------------|----------------|-----------------|
+| spark-1 | ~62 °C | 75–84 °C / 84 °C | ~2392 MHz (top rung) | 0 |
+| spark-2 | ~63 °C | 71–88 °C / 88 °C | ~2379 MHz (top rung) | 0 |
 
-- **85 °C ≈ +11% decode throughput** vs 80 °C, for ~3 °C more heat.
-- Caveat: steady-state clock is soak-sensitive. Shorter runs settled at the 1800/2000 rungs;
-  the earlier 300 s runs both bottomed at the ~1500 MHz floor under longer thermal soak. The
-  **85-vs-80 relative gap is consistent** (85 higher); only the absolute floor drifts with soak.
+Both nodes pinned to the **top ladder rung the entire run** with **zero throttle events**; the
+board stayed well under the 92 °C ceiling. This is the target behaviour — a steady clock instead
+of the v1 board-zone oscillation (~1410↔2392 MHz). The v1 80/85 °C board-zone numbers are retained
+in `README.md` for history but are not directly comparable (a board-zone target ≈ 60 °C die).
 
 ## Service design: `gb10-clock-governor.service`
 
 - Runs as **root** → `nvidia-smi` passwordless on any node (spark-2 has no passwordless rule).
-- `ExecStart` runs the governor at 85 °C; `ExecStop` resets clocks (`-rgc`).
+- `ExecStart` runs the governor at `--target 65 --ceiling 92`. No `ExecStop` (the governor resets
+  on SIGTERM anyway; a stray `ExecStop` caused a startup hang in the v1 unit).
 - `Restart=on-failure`, `RestartSec=5`. Enabled at boot (`WantedBy=multi-user.target`).
 - Unit file is `gb10-clock-governor.service` (this repo).
 
@@ -83,7 +93,7 @@ sudo systemctl enable --now gb10-clock-governor.service
   `nvidia-smi -lgc/-rgc` sudoers rule is optional — the service runs as root so it calls
   `nvidia-smi` directly and needs no per-node rule at all.
 - Verify: `systemctl status gb10-clock-governor.service` and
-  `nvidia-smi -q -d CLOCK | grep Graphics` (running clock should sit near the 2000 rung under load).
+  `nvidia-smi -q -d CLOCK | grep Graphics` (running clock should sit near the top rung under load).
 
 ## Safety notes
 

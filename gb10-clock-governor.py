@@ -1,28 +1,72 @@
 #!/usr/bin/env python3
-"""GB10 clock governor — hold a temperature target by walking the `nvidia-smi -lgc`
-cap up/down. Runs at your ceiling when cool, steps the cap down as the HOTTEST
-sensor nears the target, hands clocks back as it cools, resets to default on exit.
-Needs a NOPASSWD sudo rule for nvidia-smi -lgc/-rgc."""
-import argparse, subprocess, time, signal, sys, glob
+"""GB10 clock governor — hold the DIE temperature by walking the `nvidia-smi -lgc`
+cap up/down. Runs at your ceiling when cool, steps the cap down as the DIE nears
+the target, hands clocks back as it cools, and forces a throttle-down if any board
+thermal zone hits a safety ceiling. Resets to default on exit.
 
+Two-tier control:
+  * primary target : GPU die temperature (temperature.gpu)  -> steady clocks
+  * safety ceiling : hottest ACPI board zone               -> component guard
+
+Unlike the single-sensor version (which chased the hottest *board* zone and let the
+clock swing with board noise while the die stayed cool), the die is the controlled
+variable. The board zones only force a throttle-down at a hard ceiling, guarding
+VRM/VRAM without driving normal throttling.
+
+--dry-run prints the clock the ladder WOULD set and applies nothing — safe to run on
+a node that is live (e.g. shared inference) for validating the logic before deploying.
+
+Needs a NOPASSWD sudo rule for nvidia-smi -lgc/-rgc (or run as root).
+"""
 import argparse, subprocess, time, signal, sys, glob, os
 
 LADDER = [2400, 2200, 2000, 1800, 1700, 1500, 1300, 1200]   # MHz caps, high -> low
 
 def _nv(args):
-    # Run nvidia-smi directly when root (systemd service); else passwordless sudo.
-    exe = ["nvidia-smi"] if os.geteuid() == 0 else ["sudo", "-n", "nvidia-smi"]
-    return subprocess.run(exe + args, capture_output=True, text=True, timeout=10)
+    # Prefer a plain nvidia-smi (readable by any user; writes need root). Only fall
+    # back to passwordless sudo if the plain call fails (e.g. a privileged write run
+    # as a non-root user). Returns the first successful invocation.
+    for exe in (["nvidia-smi"], ["sudo", "-n", "nvidia-smi"]):
+        try:
+            r = subprocess.run(exe + args, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return r
+        except Exception:
+            pass
+    return subprocess.run(["nvidia-smi"] + args, capture_output=True, text=True, timeout=10)
 
-def hottest():                       # max over ALL ACPI zones + nvidia-smi GPU die
+def die():
+    try:
+        out = _nv(["--query-gpu=temperature.gpu",
+                   "--format=csv,noheader,nounits"]).stdout
+        return float([x for x in out.split() if x.strip()][0])
+    except:
+        return None
+
+def board_hot():                       # max over ALL ACPI board zones only
     t = []
     for f in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
         try: t.append(int(open(f).read()) / 1000.0)
         except: pass
-    try: t += [float(x) for x in _nv(["--query-gpu=temperature.gpu",
-                   "--format=csv,noheader,nounits"]).stdout.split() if x.strip()]
-    except: pass
-    return max(t) if t else None     # None = no readings; don't move the ladder blind
+    return max(t) if t else None       # None = unreadable; don't move the ladder blind
+
+def real_clock():                      # the clock the running governor actually set
+    try:
+        out = _nv(["-q", "-d", "CLOCK"]).stdout
+        sec = None
+        for line in out.splitlines():
+            s = line.strip()
+            if s == "Clocks":
+                sec = "c"
+            elif s.startswith("Applications Clocks"):
+                sec = None
+            elif sec == "c" and s.startswith("Graphics"):
+                for tok in s.split():
+                    if tok.isdigit():
+                        return int(tok)
+        return None
+    except:
+        return None
 
 def set_clock(mhz):
     try: return _nv(["-lgc", "0,%d" % mhz]).returncode == 0
@@ -34,30 +78,45 @@ def reset_clock():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--target", type=float, default=80)   # °C to hold, on the hottest zone
-    ap.add_argument("--hard",   type=float, default=85)   # emergency: jump straight down
-    ap.add_argument("--band",   type=float, default=2.0)  # hysteresis
-    ap.add_argument("--clock-floor", type=int, default=1500)
-    ap.add_argument("--clock-max",   type=int, default=2400)
+    ap.add_argument("--target",      type=float, default=65)  # °C to hold, on the DIE
+    ap.add_argument("--hard",        type=float, default=89)  # die emergency: step down
+    ap.add_argument("--ceiling",     type=float, default=92)  # board zone hard limit
+    ap.add_argument("--band",        type=float, default=2.0) # hysteresis
+    ap.add_argument("--clock-floor", type=int,   default=1500)
+    ap.add_argument("--clock-max",   type=int,   default=2400)
     ap.add_argument("--interval",    type=float, default=8)
+    ap.add_argument("--dry-run",     action="store_true")
     a = ap.parse_args()
 
     ladder = [m for m in LADDER if a.clock_floor <= m <= a.clock_max] or [a.clock_floor]
     ci = 0                                                # ci=0 -> highest clock
-    clock_ok = set_clock(ladder[ci])
-    signal.signal(signal.SIGTERM, lambda *_: (reset_clock(), sys.exit(0)))
-    signal.signal(signal.SIGINT,  lambda *_: (reset_clock(), sys.exit(0)))
+    if not a.dry_run:
+        clock_ok = set_clock(ladder[ci])
+    def _sig(*_):
+        if not a.dry_run:
+            reset_clock()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
 
+    logf = open("/tmp/gov-shadow.log", "a")
     while True:
-        t = hottest()
-        if t is None:                                    # sensors unreadable -> hold, retry
+        td = die(); tb = board_hot()
+        if td is None or tb is None:                     # sensors unreadable -> hold
             time.sleep(a.interval); continue
-        if t > a.target + a.band or t >= a.hard:         # HOT -> cap the clock down
-            if clock_ok and ci < len(ladder) - 1:
-                ci += 1; set_clock(ladder[ci])
-        elif t < a.target - a.band:                      # COOL -> hand the clocks back
-            if clock_ok and ci > 0:
-                ci -= 1; set_clock(ladder[ci])
+        # HOT if the die is past target, the die hits hard, OR a board zone hits ceiling
+        if td > a.target + a.band or td >= a.hard or tb >= a.ceiling:
+            if ci < len(ladder) - 1:
+                ci += 1
+        elif td < a.target - a.band:                     # COOL -> hand clocks back
+            if ci > 0:
+                ci -= 1
+        proposed = ladder[ci]
+        if not a.dry_run:
+            set_clock(proposed)
+        logf.write("%s die=%.1f board=%.1f real=%s v2=%s\n"
+                   % (time.strftime('%H:%M:%S'), td, tb, real_clock(), proposed))
+        logf.flush()
         time.sleep(a.interval)
 
 if __name__ == "__main__":
