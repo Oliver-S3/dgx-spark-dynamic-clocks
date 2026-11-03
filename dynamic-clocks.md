@@ -51,21 +51,49 @@ Closed-loop ladder of clock ceilings, driven by a **two-tier** sensor strategy:
 - Usage: `python3 gb10-clock-governor.py --target 65 --ceiling 92` (deploy), or add
   `--dry-run` to log the proposed clock without applying `-lgc`.
 
-## Why die-targeted, not board-zone?
+## Both original designs hammered the clock
 
-The GB10's board/ACPI zones run ~20–30 °C **hotter** than the die and swing hard — a single zone
-can jump ~10 °C in seconds. The original (v1) design chased the hottest board zone, so the clock
-followed the board's noise (≈1410↔2392 MHz) while the die stayed cool (~50–70 °C). We hold the
-**die** instead because:
+Neither v1 nor v2 held a steady clock. Both reacted to a sensor too noisy to control on level alone,
+which is why both were replaced.
 
-- It's the sensor NVIDIA's thermal protection watches — the GPU throttles the **die** at ~87 °C,
-  so the die is what actually caps performance and longevity.
-- It's thermally stable, so controlling it holds the clock steady instead of chasing board spikes.
-- Board zones still matter (VRM/VRAM that `nvidia-smi` can't read), so they're kept as a hard
-  **ceiling** — a fallback that bites near a component limit, never the normal driver.
+**v1 (board-zone target).** The GB10's board/ACPI zones run ~20–30 °C hotter than the die and swing
+hard — the worst measured swing is **68.2 → 50.0 °C between samples 5 s apart** (~22 °C). Chasing
+that raw sample, the clock swung **≈1410 ↔ 2392 MHz**, nearly the whole ladder, while the die stayed
+cool (~50–70 °C) and never justified the drop.
 
-Result: the clock pins to the top rung (~2390 MHz) with zero throttling; the board stays under its
-ceiling.
+**v2 (die target, board ceiling).** v2 demoted board zones to a hard `--ceiling 92` and targeted the
+die at 65 °C. That looked clean in short runs but did not survive a back-to-back benchmark sweep:
+
+| v2 config | clock range observed | clock avg | board max |
+| --- | --- | --- | --- |
+| `--target 65 --clock-max 2400` | **1976 ↔ 2392 MHz** | 2183 | 85 °C |
+| `--target 65 --ceiling 89` | **1787 ↔ 2392 MHz** | 2158 | 87 °C |
+
+The die swings **57 → 68 °C within a single 8 s tick**. Against a 65 °C target with a 2 °C band the
+trigger was crossed on nearly every sample, so the ladder walked down and up repeatedly — a ~600 MHz
+peak-to-peak swing, the same hammering as v1 from a different sensor.
+
+**And the throttling bought nothing:** those runs peaked at 84–87 °C on the board, no cooler than
+running flat at 2200 MHz with no governor (84 °C). Time was spent stepping down for heat already
+dissipating — zones fall from 83 °C to 61 °C in ~12 s once load ends.
+
+## What replaced it
+
+Two changes fix both failures:
+
+1. **Persistence, not level** — `--ceiling-samples N`: a zone must sit at/above `--ceiling` for N
+   *consecutive* samples. Verified live: a forced test accumulated `ceil_run=1, 2` then the zone
+   fell, the counter reset and **no throttle occurred**; a sustained test stepped down only on the
+   third consecutive sample and reset afterwards (one rung, not a cascade).
+2. **A clock cap as the primary protection**, die target raised so it is not the normal driver.
+
+Current policy `--target 85 --ceiling 89 --ceiling-samples 3 --clock-max 2200`:
+
+- 2200 cap bounds absolute heat for 24/7 workloads
+- die must exceed **87 °C** (`85 + band`) to act — heaviest load tested peaked at 68 °C
+- board zones must hold 89 °C for **24 s** (3 × 8 s) before the clock moves
+
+Under the benchmark that hammered v2, this held **dead flat at 2190 MHz** with a board peak of 82 °C.
 
 ## Tuning the knobs
 
@@ -73,11 +101,23 @@ ceiling.
 | --- | --- | --- | --- |
 | `--target` | GPU **die** °C to hold (primary control) | 65 | Service `ExecStart` → `daemon-reload` + `restart`. |
 | `--ceiling` | Hottest **board** zone that forces a throttle-down | 92 | Service `ExecStart` → `daemon-reload` + `restart`. |
+| `--ceiling-samples` | Consecutive samples a zone must sit at/above `--ceiling` before stepping down; `1` = react to a single sample | 1 | Service `ExecStart` → `daemon-reload` + `restart`. |
 | `--band` | Clock only moves outside `target ± band` | 2.0 °C | Script (~line 84). Edit + redeploy. |
 | `--hard` | Die emergency °C — step toward the floor | 89 °C | Script (~line 82). Edit + redeploy. |
 | `--clock-max` / `--clock-floor` | Highest / lowest ladder rung | 2400 / 1500 MHz | Script (~lines 86–85). Edit + redeploy. |
 | `--interval` | Seconds between samples | 8 | Script (~line 87). Edit + redeploy. |
 | `LADDER` | The ceiling steps themselves | `[2400,2200,…,1200]` MHz | Script (line 23). Edit + redeploy. |
+
+Note the **shipped unit** overrides the script defaults for the policy knobs:
+
+```
+ExecStart=/usr/bin/python3 /home/oliver/gb10-clock-governor.py \
+    --target 85 --ceiling 89 --ceiling-samples 3 --clock-max 2200
+```
+
+so the effective die target is 85 °C, the board ceiling 89 °C with a 3-sample gate, and the top
+rung 2200 MHz. The `65 / 92 / 2400` defaults above apply only when a knob is omitted from
+`ExecStart`.
 
 **Changing `--target` / `--ceiling`** (the common tweaks): edit `ExecStart` in the unit on each
 node, then `sudo systemctl daemon-reload && sudo systemctl restart gb10-clock-governor.service`.
@@ -106,18 +146,21 @@ in `README.md` for history but are not directly comparable (a board-zone target 
 - `Restart=on-failure`, `RestartSec=5`. Enabled at boot (`WantedBy=multi-user.target`).
 - Unit file is `gb10-clock-governor.service` (this repo).
 
-## Deployment (both sparks)
+## Deployment (per node)
 
-Per node (spark-1 = `<spark-1-ip>`, spark-2 = `<spark-2-ip>`):
+Per node:
 
 ```bash
-# 1. push the two files (user-land paths; no password):
-scp gb10-clock-governor.service oliver@<node>:/tmp/
-scp gb10-clock-governor.py  oliver@<node>:/home/oliver/
+# 1. put the script where the unit's ExecStart points (edit the unit if your home differs):
+install -m 0755 gb10-clock-governor.py ~/gb10-clock-governor.py
+
 # 2. install + enable (needs root):
-sudo cp /tmp/gb10-clock-governor.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 gb10-clock-governor.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now gb10-clock-governor.service
+
+# 3. verify exactly one writer exists:
+pgrep -af gb10-clock-governor.py
 ```
 
 - The full install (`cp /etc`, `daemon-reload`, `enable`) needs **password sudo**. A passwordless

@@ -81,6 +81,9 @@ def main():
     ap.add_argument("--target",      type=float, default=65)  # °C to hold, on the DIE
     ap.add_argument("--hard",        type=float, default=89)  # die emergency: step down
     ap.add_argument("--ceiling",     type=float, default=92)  # board zone hard limit
+    ap.add_argument("--ceiling-samples", type=int, default=1,
+                    help="consecutive samples a board zone must sit at/above --ceiling "
+                         "before stepping down; 1 (default) = react to a single sample")
     ap.add_argument("--band",        type=float, default=2.0) # hysteresis
     ap.add_argument("--clock-floor", type=int,   default=1500)
     ap.add_argument("--clock-max",   type=int,   default=2400)
@@ -99,23 +102,34 @@ def main():
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
-    logf = open("/tmp/gov-shadow.log", "a")
+    # GOV_LOG lets a non-root test run keep its own log: /tmp/gov-shadow.log may be owned
+    # by root from an earlier run. Default is unchanged for the production service.
+    logf = open(os.environ.get("GOV_LOG", "/tmp/gov-shadow.log"), "a")
+    ceiling_run = 0                                       # consecutive samples at/above ceiling
     while True:
         td = die(); tb = board_hot()
         if td is None or tb is None:                     # sensors unreadable -> hold
             time.sleep(a.interval); continue
+        # A board zone only counts as HOT once it has stayed at/above --ceiling for
+        # --ceiling-samples consecutive samples. Zones on this box are bursty -- measured
+        # jumping ~22 °C between two 8 s samples -- so with the default of 1 they can drop
+        # the clock for a spike that is already gone by the next read.
+        ceiling_run = ceiling_run + 1 if tb >= a.ceiling else 0
+        ceiling_hot = ceiling_run >= a.ceiling_samples
         # HOT if the die is past target, the die hits hard, OR a board zone hits ceiling
-        if td > a.target + a.band or td >= a.hard or tb >= a.ceiling:
+        if td > a.target + a.band or td >= a.hard or ceiling_hot:
             if ci < len(ladder) - 1:
                 ci += 1
+            ceiling_run = 0                              # one step per confirmed burst
         elif td < a.target - a.band:                     # COOL -> hand clocks back
             if ci > 0:
                 ci -= 1
         proposed = ladder[ci]
         if not a.dry_run:
             set_clock(proposed)
-        logf.write("%s die=%.1f board=%.1f real=%s v2=%s\n"
-                   % (time.strftime('%H:%M:%S'), td, tb, real_clock(), proposed))
+        logf.write("%s die=%.1f board=%.1f ceil_run=%d real=%s v2=%s\n"
+                   % (time.strftime('%H:%M:%S'), td, tb, ceiling_run,
+                      real_clock(), proposed))
         logf.flush()
         time.sleep(a.interval)
 

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Live clock monitor — reuses the governor's proven nvidia-smi clock parse so we
-compare apples to apples. Reads (die, board-max, running clock) every N seconds."""
-import importlib.util, time, sys, glob
+compare apples to apples. Reads (die, board-max, running clock) every N seconds.
 
-spec = importlib.util.spec_from_file_location("gov", "/home/oliver/gb10-clock-governor.py")
+Set GOV to the governor's path if it is not alongside this script:
+    GOV=/path/to/gb10-clock-governor.py ./monitor.py
+"""
+import importlib.util, os, pathlib, time, sys, glob
+
+GOV = os.environ.get("GOV", str(pathlib.Path(__file__).resolve().parent / "gb10-clock-governor.py"))
+spec = importlib.util.spec_from_file_location("gov", GOV)
 gov = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gov)                      # runs defs only; __name__ != "__main__"
 nv = gov._nv

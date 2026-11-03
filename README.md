@@ -55,24 +55,71 @@ python3 gb10-clock-governor.py --target 65 --ceiling 92   # hold die at 65C, boa
 python3 gb10-clock-governor.py --dry-run                  # log the clock it WOULD set, apply nothing
 ```
 
-## Why die-targeted, not board-zone?
+## Both original designs hammered the clock — measured
 
-The GB10's board/ACPI thermal zones run ~20–30 °C **hotter** than the GPU die and swing hard — a
-single zone can jump ~10 °C in a few seconds. The original (v1) design chased the **hottest board
-zone**, so the clock followed the board's noise (≈1410↔2392 MHz) even though the die itself stayed
-cool (~50–70 °C).
+This is the central finding. **Neither v1 nor v2 held a steady clock**, and both were replaced for
+the same reason: they reacted to a sensor that is too noisy to control on level alone.
 
-We switched to holding the **die** because:
+### v1 — chased the hottest board zone
 
-- It's the sensor NVIDIA's own thermal protection watches — the GPU throttles the **die** at
-  ~87 °C, so the die is what actually caps performance and longevity.
-- It's thermally stable, so controlling it holds the clock steady instead of chasing board spikes.
-- Board zones still matter (they sit on top of VRM/VRAM that `nvidia-smi` can't read), so they're
-  kept as a hard **ceiling** — but only as a fallback that bites near a component limit, never as
-  the normal driver.
+The v1 design targeted the **hottest ACPI board zone**. Board zones on this box are not merely
+higher than the die, they are *bursty*: a single zone can move ~10 °C in a few seconds, and the
+worst measured swing is **68.2 °C → 50.0 °C between two samples 5 s apart** (~22 °C).
 
-Result: the clock pins to the top rung (~2390 MHz) with zero throttling, and the board stays under
-its ceiling.
+Because the controller compared that raw sample against a target every iteration, the clock chased
+the noise:
+
+- clock swung **≈1410 ↔ 2392 MHz** — nearly the whole ladder, repeatedly
+- while the die itself stayed cool (~50–70 °C) and never justified the drop
+
+### v2 — chased the die instead, and still hammered
+
+v2 replaced the board target with a **die** target (`--target 65`) and demoted board zones to a hard
+`--ceiling 92`. The die is a better-behaved sensor, so v2 looked clean in short runs. Under a
+back-to-back 12-question benchmark sweep it did not hold up:
+
+| v2 config | clock range observed | clock avg | board max |
+| --- | --- | --- | --- |
+| `--target 65 --clock-max 2400` | **1976 ↔ 2392 MHz** | 2183 | 85 °C |
+| `--target 65 --ceiling 89` | **1787 ↔ 2392 MHz** | 2158 | 87 °C |
+
+The die swings **57 → 68 °C within a single 8 s tick**. Against a 65 °C target with a 2 °C band,
+that means the controller crossed its trigger on nearly every sample: it walked the ladder down,
+then back up, then down again. The result was a **~600 MHz peak-to-peak swing** — the same hammering
+as v1, just driven by a different sensor.
+
+**Crucially, the throttling bought nothing.** Those v2 runs peaked at 84–87 °C on the board — no
+cooler than simply running flat at 2200 MHz with no governor at all (84 °C). The controller spent
+its time stepping down for heat that was already dissipating.
+
+### Why "react to the level" is the wrong control
+
+Heat on this box is **transient and self-clearing**: after a load ends, zones fell from 83 °C to
+61 °C in about 12 s. A controller sampling every 8 s and acting on a single reading cannot
+distinguish a real thermal trend from a burst that is gone by the next tick. Both v1 and v2 made
+that mistake in different places — v1 on the board zone, v2 on the die.
+
+### What replaced it
+
+Two changes:
+
+1. **Persistence instead of level** (`--ceiling-samples`). A board zone only counts as hot once it
+   has stayed at/above `--ceiling` for N *consecutive* samples. A 2-second spike is ignored.
+2. **A clock cap as the primary protection**, with the die target set high enough that it is not
+   the normal driver.
+
+The current policy is `--target 85 --ceiling 89 --ceiling-samples 3 --clock-max 2200`:
+
+- the 2200 cap bounds absolute heat generation for 24/7 workloads
+- a die of 85 °C is treated as an acceptable sustained limit — it must reach 87 °C (`85 + band`) to
+  act, which never happened under the heaviest load tested (peak 68 °C)
+- board zones must hold 89 °C for **24 s** (3 × 8 s) before the clock moves, so bursts cannot
+  throttle it
+
+Under the same benchmark that hammered v2, this policy held **dead flat at 2190 MHz** with a board
+peak of 82 °C. See the sweep table in the next section.
+
+## Why board zones are bursty, and why `--ceiling-samples` exists
 
 ## Tuning the knobs
 
@@ -82,6 +129,7 @@ The two most-common tweaks are passed by the **service**; everything else lives 
 | --- | --- | --- | --- |
 | `--target` | GPU **die** °C to hold (the primary control) | 65 | Service `ExecStart`, then `daemon-reload` + `restart`. |
 | `--ceiling` | Hottest **board** zone that forces a throttle-down | 92 | Service `ExecStart`, then `daemon-reload` + `restart`. |
+| `--ceiling-samples` | Consecutive samples a zone must sit at/above `--ceiling` before stepping down; `1` = react to a single sample | 1 | Service `ExecStart`, then `daemon-reload` + `restart`. |
 | `--band` | Hysteresis — the clock only moves outside `target ± band` | 2.0 °C | Script, line ~84. Edit + redeploy. |
 | `--hard` | Die emergency °C — step toward the floor | 89 °C | Script, line ~82. Edit + redeploy. |
 | `--clock-max` / `--clock-floor` | Highest / lowest ladder rung | 2400 / 1500 MHz | Script, lines 86–85. Edit + redeploy. |
@@ -96,30 +144,65 @@ sudo systemctl daemon-reload && sudo systemctl restart gb10-clock-governor.servi
 ```
 
 Any other knob is a **script** edit — change the value, then re-deploy the script and restart on
-both nodes. (The service runs as root, so the script edits also go to `/home/oliver/gb10-clock-governor.py`.)
+both nodes. (The service runs as root, so script edits must also be copied to the path in `ExecStart`.)
 
 ## Measured effect (v2 — die target + board ceiling)
 
-Two-tier config `--target 65 --ceiling 92`, both nodes under a deepseek-v4.x decode workload:
+An early v2 run, `--target 65 --ceiling 92`, both nodes under a deepseek-v4.x decode workload:
 
 | Node | Die (steady) | Board (steady / max) | Clock (steady) | Throttle events |
 |------|--------------|----------------------|----------------|-----------------|
 | spark-1 | ~62 °C | 75–84 °C / 84 °C | ~2392 MHz (top rung) | 0 |
 | spark-2 | ~63 °C | 71–88 °C / 88 °C | ~2379 MHz (top rung) | 0 |
 
-The die settles at the target while the board stays well under the 92 °C ceiling, and the clock
-holds the **top ladder rung the entire time** — no oscillation, zero throttling. This is the
-intended improvement over the v1 board-zone design, which chased the hottest board zone and let the
-clock swing ~1410↔2392 MHz while the die stayed cool (~50–70 °C). (The v1 80/85 °C numbers above
-referred to a *board-zone* target ≈ 60 °C die; the v2 die target is a different, cooler sensor, so
-the two are not directly comparable by number.)
+**This is a best case, not the general behaviour.** On a longer single workload the die happened to
+settle at the target without crossing it often. Under a back-to-back benchmark sweep — where the
+die rises and falls between questions — the same `--target 65` config hammered the ladder
+(1976↔2392 MHz, see "Both original designs hammered the clock" above). Do not read this table as
+evidence that v2 is stable; the stability came later, from the persistence gate.
+
+(Also note: the v1 80/85 °C numbers elsewhere refer to a *board-zone* target ≈ 60 °C die; the v2 die
+target is a different, cooler sensor, so the two are not directly comparable by number.)
+
+## Why board zones are bursty, and why `--ceiling-samples` exists
+
+On a GB10 the die and the ACPI board zones are **decoupled and both bursty**. Measured on one
+node at a flat 2200 MHz cap: the hottest zone jumped **68.2 °C → 50.0 °C between two samples 5 s
+apart**, and the die swung **57 → 68 °C within a single 8 s tick**. Heat is transient and
+self-clearing — after a load ends, zones fell from 83 °C to 61 °C in about 12 s.
+
+That is why targeting either value on *level alone* oscillates. In a sweep of eight governor
+configurations under the same benchmark:
+
+| Configuration | Clock behaviour | Zone max |
+| --- | --- | --- |
+| flat `-lgc 0,2200`, no governor | dead flat 2190 | 84 °C |
+| `--target 65 --clock-max 2200` | **dropped to 1976 repeatedly** | 84 °C |
+| `--target 65 --ceiling 89` | dropped to 1787 | 87 °C |
+| `--target 85 --ceiling 89 --ceiling-samples 3 --clock-max 2200` | dead flat 2190 | 82 °C |
+
+The die-targeted configurations spent their time stepping down and produced **no cooler zones**
+than simply running flat. The persistence rule is the fix: a zone only counts as hot once it has
+stayed at/above `--ceiling` for `--ceiling-samples` consecutive samples, so a 2-second spike is
+ignored. With `--ceiling-samples 3` at the default 8 s interval that is 24 s of sustained heat.
+
+Verified live: a forced test (`--ceiling 60`) accumulated `ceil_run=1, 2` across a spike that then
+fell — the counter reset and **no throttle occurred**. A sustained test stepped down only on the
+third consecutive sample, and reset the counter after acting so it moves one rung at a time.
+
+**This box has no stock thermal backstop.** `nvidia-smi` reports no slowdown or shutdown
+temperature for the GB10, no board zone has a kernel `crit` trip point, and the throttle flags read
+`0x0`. Nothing protects it thermally unless userland does — which is the entire argument for
+running the governor.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `gb10-clock-governor.py` | The governor (closed-loop clock ladder). |
+| `gb10-zone-guard.py` | Alternative guard that acts on **zone persistence only** (die ignored by default). Useful when the die is an acceptable proxy and only sustained zone heat matters. |
 | `gb10-clock-governor.service` | systemd unit: runs the governor as **root**, `Restart=on-failure`, enabled at boot. |
+| `test_variants.sh` | Sweeps clock/thermal variants back-to-back (runs the governor as a plain user via the `sudo -n nvidia-smi` fallback, so no root shell is needed), sampling clocks and zones throughout. |
 | `verify-gov.sh` | Prints the running clock, GPU temp, and hottest thermal zone — for a quick check. |
 | `monitor.py` | Read-only observer: logs die, board, and running clock (reuses the governor's clock parse). Never writes a clock — safe on a live, shared-GPU node for validating the logic. |
 | `dynamic-clocks.md` | Extended notes (mechanism, test results, safety). |
@@ -132,23 +215,38 @@ script falls back to `sudo -n nvidia-smi` when not root.
 ## Deploy (per node)
 
 The install (`cp /etc/systemd/system`, `daemon-reload`, `enable`) needs **password sudo** on the
-target node. Run as the deployment user (e.g. `oliver`):
+target node. Run as the deployment user:
 
 ```bash
-# 1. push the two files (user-land paths; no password)
-scp gb10-clock-governor.service oliver@<spark-1-ip>:/tmp/
-scp gb10-clock-governor.py       oliver@<spark-1-ip>:/home/oliver/
+# 1. put the script where the unit expects it (edit ExecStart if your home differs)
+install -m 0755 gb10-clock-governor.py ~/gb10-clock-governor.py
 
 # 2. install + enable (password sudo):
-sudo cp /tmp/gb10-clock-governor.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 gb10-clock-governor.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now gb10-clock-governor.service
 
 # 3. verify:
 systemctl is-active gb10-clock-governor.service     # -> active
-pgrep -af gb10-clock-governor.py                     # -> the governor process
+pgrep -af gb10-clock-governor.py                     # -> exactly ONE process
 ./verify-gov.sh                                       # clock + hottest-zone temp
 ```
+
+The unit ships with `ExecStart=... /home/oliver/gb10-clock-governor.py`; change that path if your
+deployment user's home is elsewhere.
+
+## Two clock writers cannot coexist
+
+Only one process may own `nvidia-smi -lgc`. The governor re-applies its rung every interval, so a
+manual `nvidia-smi -lgc 0,2200` is overwritten within one tick (~8 s), and two governors fight for
+the ladder. Before starting it, confirm nothing else is writing:
+
+```bash
+pgrep -af gb10-clock-governor.py     # expect nothing, or exactly one
+```
+
+Watch for leftover units too — a manually-created unit pointing at the same script is a second
+writer, and `systemctl disable` on one unit does not stop another.
 
 ## Safety
 
@@ -174,7 +272,7 @@ sudo systemctl disable --now gb10-clock-governor.service
 sudo rm /etc/systemd/system/gb10-clock-governor.service
 
 # 3. Remove the governor script
-sudo rm /home/oliver/gb10-clock-governor.py
+sudo rm ~/gb10-clock-governor.py
 
 # 4. Refresh systemd
 sudo systemctl daemon-reload

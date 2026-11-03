@@ -1,13 +1,14 @@
 [Unit]
-Description=GB10 dynamic clock governor v2 (SparkCluster, die 65C / board ceiling 92C)
-Documentation=file:///home/oliver/Development/SparkCluster/dgx-spark-dynamic-clocks/README.md
+Description=GB10 dynamic clock governor (die 85C target / board-zone 89C ceiling x3 samples / 2200MHz cap)
+Documentation=https://github.com/Oliver-S3/dgx-spark-dynamic-clocks
 
 [Service]
 Type=simple
 User=root
 Restart=on-failure
 RestartSec=5
-ExecStart=/usr/bin/python3 /home/oliver/gb10-clock-governor.py --target 65 --ceiling 92
+# Adjust the script path to the deployment user's home if it is not /home/oliver:
+ExecStart=/usr/bin/python3 /home/oliver/gb10-clock-governor.py --target 85 --ceiling 89 --ceiling-samples 3 --clock-max 2200
 
 [Install]
 WantedBy=multi-user.target
