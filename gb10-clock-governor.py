@@ -104,7 +104,15 @@ def main():
 
     # GOV_LOG lets a non-root test run keep its own log: /tmp/gov-shadow.log may be owned
     # by root from an earlier run. Default is unchanged for the production service.
-    logf = open(os.environ.get("GOV_LOG", "/tmp/gov-shadow.log"), "a")
+    logpath = os.environ.get("GOV_LOG", "/tmp/gov-shadow.log")
+    try:
+        logf = open(logpath, "a")
+    except OSError as e:
+        # A root service cannot O_CREAT-append a sticky /tmp file owned by another user
+        # (fs.protected_regular). Fall back to stderr instead of crash-looping under systemd.
+        print("warning: cannot append to %s (%s); logging to stderr" % (logpath, e),
+              file=sys.stderr)
+        logf = sys.stderr
     ceiling_run = 0                                       # consecutive samples at/above ceiling
     while True:
         td = die(); tb = board_hot()

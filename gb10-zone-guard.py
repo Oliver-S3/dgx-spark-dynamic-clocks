@@ -132,7 +132,16 @@ def main():
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
-    logf = open(os.environ.get("GOV_LOG", "/tmp/zone-guard.log"), "a")
+    logpath = os.environ.get("GOV_LOG", "/tmp/zone-guard.log")
+    try:
+        logf = open(logpath, "a")
+    except OSError as e:
+        # /tmp is sticky and fs.protected_regular refuses an O_CREAT open of a file
+        # owned by another user -- even for root. Never crash-loop the guard over
+        # logging: fall back to stderr, which journald captures under systemd.
+        print("warning: cannot append to %s (%s); logging to stderr" % (logpath, e),
+              file=sys.stderr)
+        logf = sys.stderr
 
     hot_run = 0
     cool_run = 0

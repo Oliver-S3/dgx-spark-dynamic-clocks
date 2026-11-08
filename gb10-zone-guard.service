@@ -7,6 +7,9 @@ Type=simple
 User=root
 Restart=always
 RestartSec=5
+# Keep the log out of sticky /tmp: a root service cannot append to a /tmp file that
+# another user owns (fs.protected_regular), which crash-looped this unit on spark-1.
+Environment=GOV_LOG=/var/log/gb10-zone-guard.log
 # Bounded two-rung policy: 2200 top, 2000 floor, so one confirmed hotspot can only cost one rung.
 # --die-guard 89 is an emergency backstop: the zone signal cannot see a die runaway, so a die
 # at/above 89C cascades to the floor regardless of what the board zones read.
