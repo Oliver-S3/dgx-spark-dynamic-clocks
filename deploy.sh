@@ -34,8 +34,10 @@ install -m 0755 "$DEST/gb10-zone-guard.py"    "$HOME/gb10-zone-guard.py"
 install -m 0755 "$DEST/monitor.py"            "$HOME/monitor.py"
 install -m 0755 "$DEST/verify-gov.sh"         "$HOME/verify-gov.sh"
 
-# 3. Install the chosen unit, and stop/disable the other so one writer cannot fight another.
-sudo install -o root -g root -m 0644 "$DEST/$UNIT" /etc/systemd/system/
+# 3. Install BOTH unit files from the checkout so /etc matches the repo byte-for-byte,
+#    then stop/disable the one that must not run so a single writer owns -lgc.
+sudo install -o root -g root -m 0644 "$DEST/gb10-clock-governor.service" /etc/systemd/system/
+sudo install -o root -g root -m 0644 "$DEST/gb10-zone-guard.service"    /etc/systemd/system/
 sudo systemctl daemon-reload
 for u in gb10-clock-governor.service gb10-zone-guard.service; do
   [ "$u" = "$UNIT" ] || sudo systemctl disable --now "$u" 2>/dev/null || true
