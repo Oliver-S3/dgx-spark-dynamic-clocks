@@ -43,11 +43,15 @@ for u in gb10-clock-governor.service gb10-zone-guard.service; do
   [ "$u" = "$UNIT" ] || sudo systemctl disable --now "$u" 2>/dev/null || true
 done
 # Hand-launched (detached) guards are not systemd-managed and would be a second
-# writer. Kill only the user-owned strays; the root unit processes are already stopped.
-pkill -f 'gb10-zone-guard.py' || true
-pkill -f 'gb10-clock-governor.py' || true
+# writer. pkill only reaches processes of the invoking uid, which is exactly the
+# detached ones; the root unit process is handled by the restart below.
+pkill -f 'gb10-zone-guard.py'    2>/dev/null || true
+pkill -f 'gb10-clock-governor.py' 2>/dev/null || true
 sleep 1
-sudo systemctl enable --now "$UNIT"
+sudo systemctl enable "$UNIT"
+# `enable --now` is a no-op when the unit is already active, which would leave the
+# old in-memory script running. Restart unconditionally so new code + env are loaded.
+sudo systemctl restart "$UNIT"
 
 # 4. Verify the node now matches the checkout.
 sleep 2
