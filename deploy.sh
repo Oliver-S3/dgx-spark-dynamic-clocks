@@ -20,6 +20,8 @@ case "$ROLE" in
 esac
 
 # 1. Checkout at origin/HEAD (fresh clone, or fast-forward an existing one).
+SELF=$0
+SELF_HASH=$(sha256sum "$SELF" | awk '{print $1}')
 if [ -d "$DEST/.git" ]; then
   git -C "$DEST" fetch --prune origin
   git -C "$DEST" reset --hard "origin/$BRANCH"
@@ -27,6 +29,15 @@ else
   git clone --branch "$BRANCH" "$REPO_URL" "$DEST"
 fi
 echo "repo: $DEST @ $(git -C "$DEST" rev-parse --short HEAD)"
+
+# The reset above replaces this script on disk, but bash is still reading the old
+# inode, so any new logic in a just-pulled deploy.sh would be silently skipped.
+# Re-exec once so the run completes with the code that is actually checked out.
+if [ "${DEPLOY_REEXEC:-0}" != "1" ] &&
+   [ "$(sha256sum "$SELF" | awk '{print $1}')" != "$SELF_HASH" ]; then
+  echo "deploy.sh changed in this checkout; re-executing the updated copy"
+  DEPLOY_REEXEC=1 exec bash "$SELF" "$ROLE"
+fi
 
 # 2. Install the scripts where the units' ExecStart expects them.
 install -m 0755 "$DEST/gb10-clock-governor.py" "$HOME/gb10-clock-governor.py"
