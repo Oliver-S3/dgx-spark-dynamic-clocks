@@ -6,6 +6,14 @@ runtime clock ceiling up/down, so clocks and throughput self-adjust to the therm
 instead of running flat at max boost. A hard board-zone ceiling guards VRM/VRAM without
 driving normal throttling.
 
+> **Current deployment (2026-11-08).** Both nodes run `gb10-zone-guard.service`, not the
+> governor; `gb10-clock-governor.service` is installed but disabled. The guard caps the clock at
+> 2200 MHz and latches to 2000 after 3 consecutive samples at/above 88 °C on the hottest ACPI
+> zone, returning only after 8 samples below 82 °C; a die backstop cascades to the floor at
+> 89 °C. Deploy with `./deploy.sh zone-guard`. Why the governor was retired as the live role —
+> its board-ceiling branch self-cancels against the die target — is recorded in
+> [notes/2026-11-08-zone-guard-cutover.md](notes/2026-11-08-zone-guard-cutover.md).
+
 > **Why this exists.** The DGX Spark's fans barely ramp at high temperatures and cannot be
 > adjusted from userland — NVIDIA's embedded-controller (EC) owns the whole cooling policy and
 > lets the hottest ACPI zones climb to ~96–97 °C under load. Forcing fan RPM floors is one
@@ -208,6 +216,7 @@ running the governor.
 | `verify-gov.sh` | Prints the running clock, GPU temp, and hottest thermal zone — for a quick check. |
 | `monitor.py` | Read-only observer: logs die, board, and running clock (reuses the governor's clock parse). Never writes a clock — safe on a live, shared-GPU node for validating the logic. |
 | `dynamic-clocks.md` | Extended notes (mechanism, test results, safety). |
+| `notes/` | Dated session notes: what was found/fixed on the nodes and the verified end state. |
 | `before.png` / `after.png` | Before/after thermal screenshots. |
 
 **Why the service runs as root.** Root runs `nvidia-smi` directly with no password, so the same

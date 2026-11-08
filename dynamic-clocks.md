@@ -6,6 +6,10 @@ A systemd service that runs a closed-loop clock governor on each GB10 node using
 ceiling guards VRM/VRAM without driving normal throttling. Clocks and throughput
 self-adjust to the thermal situation instead of running flat at max boost.
 
+> **Status note (2026-11-08).** This document is the design history of the governor. The live
+> role on both nodes is now `gb10-zone-guard.service`; `gb10-clock-governor.service` is
+> installed but disabled. See [notes/2026-11-08-zone-guard-cutover.md](notes/2026-11-08-zone-guard-cutover.md).
+
 ## TL;DR
 
 - Under a heavy sustained decode load, `nvidia-smi -lgc` **does** throttle the clock on GB10.
