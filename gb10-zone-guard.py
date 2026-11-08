@@ -175,9 +175,13 @@ def main():
             cool_run = 0
 
         proposed = ladder[ci]
-        if acted and not a.dry_run:
+        # Re-assert the rung every tick, not just on a decision. Stopping the production
+        # governor sends -rgc, which unlocks the cap; without this re-write the clock would
+        # boost back to default and undo the guard until the next hot streak.
+        if not a.dry_run:
             set_clock(proposed)
-            acted += " applied"
+            if acted:
+                acted += " applied"
         elif acted:
             acted += " (dry-run)"
 

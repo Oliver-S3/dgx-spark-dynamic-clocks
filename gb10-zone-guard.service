@@ -1,0 +1,14 @@
+[Unit]
+Description=GB10 board-zone guard (step down at sustained 88C; step up only after 64s below 82C)
+Documentation=https://github.com/Oliver-S3/dgx-spark-dynamic-clocks
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5
+# Bounded two-rung policy: 2200 top, 2000 floor, so one confirmed hotspot can only cost one rung.
+ExecStart=/usr/bin/python3 /home/oliver/gb10-zone-guard.py --clock-max 2200 --clock-floor 2000 --hot 88 --hot-samples 3 --cool 82 --cool-samples 8
+
+[Install]
+WantedBy=multi-user.target

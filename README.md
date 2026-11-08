@@ -202,6 +202,8 @@ running the governor.
 | `gb10-clock-governor.py` | The governor (closed-loop clock ladder). |
 | `gb10-zone-guard.py` | Alternative guard that acts on **zone persistence only** (die ignored by default). Useful when the die is an acceptable proxy and only sustained zone heat matters. |
 | `gb10-clock-governor.service` | systemd unit: runs the governor as **root**, `Restart=on-failure`, enabled at boot. |
+| `gb10-zone-guard.service` | systemd unit: runs the zone guard as **root**, `Restart=always`, bounded 2200→2000 MHz policy. |
+| `deploy.sh` | Git-based deploy: clone/fast-forward the repo on a node, install scripts + one unit, leave exactly one clock writer. |
 | `test_variants.sh` | Sweeps clock/thermal variants back-to-back (runs the governor as a plain user via the `sudo -n nvidia-smi` fallback, so no root shell is needed), sampling clocks and zones throughout. |
 | `verify-gov.sh` | Prints the running clock, GPU temp, and hottest thermal zone — for a quick check. |
 | `monitor.py` | Read-only observer: logs die, board, and running clock (reuses the governor's clock parse). Never writes a clock — safe on a live, shared-GPU node for validating the logic. |
@@ -212,27 +214,34 @@ running the governor.
 unit works on every node without needing a per-node passwordless-`nvidia-smi` sudoers rule. The
 script falls back to `sudo -n nvidia-smi` when not root.
 
-## Deploy (per node)
+## Deploy (per node) — git-based
 
-The install (`cp /etc/systemd/system`, `daemon-reload`, `enable`) needs **password sudo** on the
-target node. Run as the deployment user:
+Deployment is deliberately tied to a commit, so a node runs an exact revision instead of a
+hand-copied file. The unit install needs **password sudo**; everything else runs as the
+deployment user:
 
 ```bash
-# 1. put the script where the unit expects it (edit ExecStart if your home differs)
-install -m 0755 gb10-clock-governor.py ~/gb10-clock-governor.py
-
-# 2. install + enable (password sudo):
-sudo install -o root -g root -m 0644 gb10-clock-governor.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now gb10-clock-governor.service
-
-# 3. verify:
-systemctl is-active gb10-clock-governor.service     # -> active
-pgrep -af gb10-clock-governor.py                     # -> exactly ONE process
-./verify-gov.sh                                       # clock + hottest-zone temp
+git clone https://github.com/Oliver-S3/dgx-spark-dynamic-clocks.git ~/dgx-spark-dynamic-clocks
+cd ~/dgx-spark-dynamic-clocks && ./deploy.sh governor     # or: ./deploy.sh zone-guard
 ```
 
-The unit ships with `ExecStart=... /home/oliver/gb10-clock-governor.py`; change that path if your
+`deploy.sh` does, in order:
+
+1. clone, or `fetch` + `reset --hard origin/main`, and print the deployed commit;
+2. install `gb10-clock-governor.py`, `gb10-zone-guard.py`, `monitor.py`, `verify-gov.sh` into
+   `$HOME` (where each unit's `ExecStart` expects them);
+3. install the chosen unit to `/etc/systemd/system/`, `daemon-reload`, **disable the other unit**
+   so only one process owns `nvidia-smi -lgc`, then `enable --now` the chosen one;
+4. verify: `pgrep -af gb10-`, unit state, running clock, and script hashes vs the checkout.
+
+Confirm the node matches GitHub (same short SHA on every node and on `origin/main`):
+
+```bash
+git -C ~/dgx-spark-dynamic-clocks rev-parse --short HEAD
+sha256sum ~/gb10-clock-governor.py ~/gb10-zone-guard.py
+```
+
+The units ship with `ExecStart=... /home/oliver/...`; change that path in the unit if your
 deployment user's home is elsewhere.
 
 ## Two clock writers cannot coexist
