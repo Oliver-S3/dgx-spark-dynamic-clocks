@@ -1,5 +1,5 @@
 [Unit]
-Description=GB10 board-zone guard (step down at sustained 88C; step up only after 64s below 82C)
+Description=GB10 board-zone guard (88C x3 down / 82C x8 up; die emergency backstop 89C)
 Documentation=https://github.com/Oliver-S3/dgx-spark-dynamic-clocks
 
 [Service]
@@ -8,7 +8,9 @@ User=root
 Restart=always
 RestartSec=5
 # Bounded two-rung policy: 2200 top, 2000 floor, so one confirmed hotspot can only cost one rung.
-ExecStart=/usr/bin/python3 /home/oliver/gb10-zone-guard.py --clock-max 2200 --clock-floor 2000 --hot 88 --hot-samples 3 --cool 82 --cool-samples 8
+# --die-guard 89 is an emergency backstop: the zone signal cannot see a die runaway, so a die
+# at/above 89C cascades to the floor regardless of what the board zones read.
+ExecStart=/usr/bin/python3 /home/oliver/gb10-zone-guard.py --clock-max 2200 --clock-floor 2000 --hot 88 --hot-samples 3 --cool 82 --cool-samples 8 --die-guard 89
 
 [Install]
 WantedBy=multi-user.target
