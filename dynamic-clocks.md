@@ -8,7 +8,7 @@ self-adjust to the thermal situation instead of running flat at max boost.
 
 > **Status note (2026-11-08).** This document is the design history of the governor. The live
 > role on both nodes is now `gb10-zone-guard.service`; `gb10-clock-governor.service` is
-> installed but disabled. See [notes/2026-11-08-zone-guard-cutover.md](notes/2026-11-08-zone-guard-cutover.md).
+> installed but disabled.
 
 ## TL;DR
 

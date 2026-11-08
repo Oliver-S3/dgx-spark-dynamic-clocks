@@ -1,2 +1,26 @@
 __pycache__/
 *.pyc
+
+# Test / experiment output — must never be committed or pushed.
+# test_variants.sh writes ~/variant-results/<UTC stamp>/<variant>/{bench.json,clocks.csv,
+# summary.txt,governor.log,shadow.log,bench.log,gov.pid}; keep all of that out of the repo.
+variant-results/
+results/
+out/
+*.log
+*.csv
+bench*.json
+*.pid
+*.tmp
+*.out
+
+# Session notes / scratch docs: kept local, consolidated into the real docs before publishing.
+notes/
+scratch/
+WORKING*.md
+draft-*.md
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
